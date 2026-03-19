@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: apt-deb-collect [options] <package> [package ...]
+
+Options:
+  -a, --arch <arch>     Target architecture. Default: native architecture
+  -o, --out <dir>       Output root directory. Default: current directory
+      --dry-run         Resolve dependencies and write manifests only
+  -h, --help            Show this help
+
+Notes:
+  - Recursively tracks Depends and PreDepends.
+  - Resolves virtual packages to a concrete provider.
+  - Writes one output directory per requested root package.
+EOF
+}
+
+log() {
+  printf '[INFO] %s\n' "$*"
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[ERR ] %s\n' "$*" >&2
+  exit 1
+}
+
+ARCH="$(dpkg --print-architecture)"
+OUT_ROOT="$(pwd)"
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--arch)
+      [[ $# -ge 2 ]] || die "--arch requires a value"
+      ARCH="$2"
+      shift 2
+      ;;
+    -o|--out)
+      [[ $# -ge 2 ]] || die "--out requires a value"
+      OUT_ROOT="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+[[ $# -gt 0 ]] || {
+  usage
+  exit 1
+}
+
+mkdir -p "${OUT_ROOT}"
+
+arch_enabled() {
+  local arch="$1"
+  dpkg --print-architecture | grep -qx "${arch}" && return 0
+  dpkg --print-foreign-architectures | grep -qx "${arch}"
+}
+
+if ! arch_enabled "${ARCH}"; then
+  die "architecture ${ARCH} is not enabled in dpkg. Run: sudo dpkg --add-architecture ${ARCH} && sudo apt-get update"
+fi
+
+qualify_pkg() {
+  local pkg="$1"
+  if [[ "${pkg}" == *:any || "${pkg}" == *:native ]]; then
+    printf '%s\n' "${pkg}"
+    return 0
+  fi
+  if [[ "${pkg}" == *:* ]]; then
+    printf '%s\n' "${pkg}"
+  else
+    printf '%s:%s\n' "${pkg}" "${ARCH}"
+  fi
+}
+
+strip_arch() {
+  local pkg="$1"
+  printf '%s\n' "${pkg%%:*}"
+}
+
+normalize_query_pkg() {
+  local pkg="$1"
+  if [[ "${pkg}" == *:any || "${pkg}" == *:native ]]; then
+    printf '%s\n' "$(strip_arch "${pkg}")"
+  else
+    printf '%s\n' "${pkg}"
+  fi
+}
+
+strip_virtual_markers() {
+  local atom="$1"
+  atom="${atom#<}"
+  atom="${atom%>}"
+  printf '%s\n' "${atom}"
+}
+
+pkg_exists() {
+  local pkg="$1"
+  apt-cache show --no-all-versions "$(normalize_query_pkg "${pkg}")" >/dev/null 2>&1
+}
+
+pkg_installed() {
+  local pkg="$1"
+  dpkg-query -W -f='${Status}\n' "$(strip_arch "${pkg}")" 2>/dev/null | grep -q "install ok installed"
+}
+
+list_virtual_providers() {
+  local virtual="$1"
+  apt-cache showpkg "${virtual}" 2>/dev/null | awk '
+    BEGIN { in_block = 0 }
+    /^Reverse Provides:/ { in_block = 1; next }
+    in_block && /^$/ { exit }
+    in_block && NF > 0 { print $1 }
+  ' | sort -u
+}
+
+choose_provider() {
+  local virtual="$1"
+  local provider
+
+  if pkg_exists "${virtual}"; then
+    printf '%s\n' "$(qualify_pkg "$(normalize_query_pkg "${virtual}")")"
+    return 0
+  fi
+
+  mapfile -t providers < <(list_virtual_providers "${virtual}")
+  [[ ${#providers[@]} -gt 0 ]] || return 1
+
+  for provider in "${providers[@]}"; do
+    if pkg_installed "${provider}"; then
+      printf '%s\n' "$(qualify_pkg "${provider}")"
+      return 0
+    fi
+  done
+
+  if [[ ${#providers[@]} -eq 1 ]]; then
+    printf '%s\n' "$(qualify_pkg "${providers[0]}")"
+    return 0
+  fi
+
+  for provider in "${providers[@]}"; do
+    if pkg_exists "$(qualify_pkg "${provider}")"; then
+      printf '%s\n' "$(qualify_pkg "${provider}")"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "$(qualify_pkg "${providers[0]}")"
+}
+
+list_direct_deps() {
+  local pkg="$1"
+  apt-cache depends "${pkg}" 2>/dev/null | awk '
+    /^[[:space:]]*\|?(Pre)?Depends:/ {
+      dep = $NF
+      if (dep != "") {
+        print dep
+      }
+    }
+  ' | sort -u
+}
+
+download_pkg() {
+  local pkg="$1"
+  local query_pkg
+  local rc=0
+
+  query_pkg="$(normalize_query_pkg "${pkg}")"
+
+  if ! apt download "${query_pkg}" >/dev/null 2>&1; then
+    if [[ "${query_pkg}" == *:* ]]; then
+      if ! apt download "$(strip_arch "${query_pkg}")" >/dev/null 2>&1; then
+        rc=1
+      fi
+    else
+      rc=1
+    fi
+  fi
+
+  return "${rc}"
+}
+
+for root_pkg in "$@"; do
+  ROOT_NAME="$(strip_arch "${root_pkg}")"
+  ROOT_SPEC="$(qualify_pkg "${root_pkg}")"
+  OUT_DIR="${OUT_ROOT}/${ROOT_NAME}"
+  PKG_DIR="${OUT_DIR}/packages"
+  PKG_LIST="${OUT_DIR}/pkgs.txt"
+  FAIL_LIST="${OUT_DIR}/failed.txt"
+  PROVIDER_LOG="${OUT_DIR}/providers.txt"
+
+  mkdir -p "${PKG_DIR}"
+  : > "${PKG_LIST}"
+  : > "${FAIL_LIST}"
+  : > "${PROVIDER_LOG}"
+
+  if ! pkg_exists "${ROOT_SPEC}" && ! pkg_exists "${ROOT_NAME}"; then
+    die "package not found in apt metadata: ${root_pkg}"
+  fi
+
+  if pkg_exists "${ROOT_SPEC}"; then
+    ROOT_ENQUEUE="${ROOT_SPEC}"
+  else
+    ROOT_ENQUEUE="${ROOT_NAME}"
+  fi
+
+  log "Collecting recursive dependencies for ${ROOT_SPEC}"
+
+  declare -A queued=()
+  declare -A visited=()
+  queue=()
+  resolved=()
+
+  enqueue() {
+    local item="$1"
+    [[ -n "${item}" ]] || return 0
+    if [[ -z "${queued[${item}]+x}" ]]; then
+      queue+=("${item}")
+      queued["${item}"]=1
+    fi
+  }
+
+  enqueue "${ROOT_ENQUEUE}"
+
+  while [[ ${#queue[@]} -gt 0 ]]; do
+    current="${queue[0]}"
+    queue=("${queue[@]:1}")
+
+    if [[ -n "${visited[${current}]+x}" ]]; then
+      continue
+    fi
+    visited["${current}"]=1
+
+    if pkg_exists "${current}"; then
+      resolved+=("${current}")
+      while IFS= read -r dep; do
+        [[ -n "${dep}" ]] || continue
+        if [[ "${dep}" == \<*\> ]]; then
+          virtual_name="$(strip_virtual_markers "${dep}")"
+          if provider="$(choose_provider "${virtual_name}")"; then
+            printf '%s -> %s\n' "${virtual_name}" "${provider}" >> "${PROVIDER_LOG}"
+            enqueue "${provider}"
+          else
+            warn "no provider found for virtual package: ${virtual_name}"
+          fi
+        else
+          enqueue "$(qualify_pkg "${dep}")"
+        fi
+      done < <(list_direct_deps "${current}")
+      continue
+    fi
+
+    virtual_name="$(strip_virtual_markers "$(strip_arch "${current}")")"
+    if provider="$(choose_provider "${virtual_name}")"; then
+      printf '%s -> %s\n' "${virtual_name}" "${provider}" >> "${PROVIDER_LOG}"
+      enqueue "${provider}"
+    else
+      warn "skipping unresolved package: ${current}"
+    fi
+  done
+
+  printf '%s\n' "${resolved[@]}" | sed '/^$/d' | sort -u > "${PKG_LIST}"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "Dry run complete for ${ROOT_SPEC}"
+    log "Manifest: ${PKG_LIST}"
+    continue
+  fi
+
+  pushd "${PKG_DIR}" >/dev/null
+  while IFS= read -r pkg; do
+    [[ -n "${pkg}" ]] || continue
+    printf '[DL] %s\n' "${pkg}"
+    if ! download_pkg "${pkg}"; then
+      echo "${pkg}" >> "${FAIL_LIST}"
+    fi
+  done < "${PKG_LIST}"
+  popd >/dev/null
+
+  if command -v dpkg-scanpackages >/dev/null 2>&1; then
+    pushd "${PKG_DIR}" >/dev/null
+    dpkg-scanpackages . /dev/null | gzip -9c > Packages.gz
+    popd >/dev/null
+  fi
+
+  if [[ ! -s "${FAIL_LIST}" ]]; then
+    rm -f "${FAIL_LIST}"
+    log "All packages downloaded for ${ROOT_SPEC}"
+  else
+    warn "Some packages failed to download. See ${FAIL_LIST}"
+  fi
+
+  log "Output dir: ${OUT_DIR}"
+done
