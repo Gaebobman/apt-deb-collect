@@ -1,6 +1,30 @@
 # apt-deb-collect
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Shell: Bash](https://img.shields.io/badge/Shell-Bash-121011?logo=gnu-bash)](#)
+[![OS: Ubuntu%20%7C%20Debian](https://img.shields.io/badge/OS-Ubuntu%20%7C%20Debian-E95420?logo=ubuntu)](#)
+
 `apt-deb-collect` is a small utility for building an offline `.deb` bundle from Ubuntu/Debian package metadata.
+
+## Quick start
+
+Resolve packages only:
+
+```bash
+./apt-deb-collect --dry-run nvidia-container-toolkit
+```
+
+Download a recursive offline bundle:
+
+```bash
+./apt-deb-collect --out /tmp/deb-bundle nvidia-container-toolkit
+```
+
+Download for a different target architecture:
+
+```bash
+./apt-deb-collect --arch arm64 --out /tmp/deb-bundle nvidia-container-toolkit
+```
 
 ## Why this script exists
 
